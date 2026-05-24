@@ -5,12 +5,13 @@
 ```js
 module.exports = {
   id: 'blender',
+  extensions: ['.py'],
   exec: {
     match: /^exec:blender/,
     run(code, cwd) { /* returns Promise<string> */ }
   },
   lsp: {                                           // optional
-    check(code, cwd) { /* returns Promise<Diagnostic[]> */ }
+    check(code, cwd) { /* returns Diagnostic[] */ }
   },
   context: 'string or () => string'               // optional
 };
@@ -29,36 +30,34 @@ type Diagnostic = {
 
 ## Plugin Loading
 
-- gm-cc scans `<projectDir>/lang/*.js` at hook time — no project-level hook setup needed
+- Plugins live at `<projectDir>/lang/*.js`. `loader.js` is excluded.
+- Each plugin is loaded host-side via `gm-plugkit/lang-host-runner.js`
 - Validates shape `{ id, exec: { match, run } }` — invalid plugins are silently skipped
-- `lang/loader.js` is a convenience export for testing; hooks inline their own loader
 
-## exec: Dispatch (pre-tool-use hook — gm-cc managed)
+## Spool Invocation
 
-Intercepts `exec:<id>\n<code>` when `<id>` is not a built-in lang.
+The runner is invoked directly:
 
-1. Find first plugin where `plugin.exec.match.test(command)`
-2. Call `plugin.exec.run(code, cwd)` in a child process (30s timeout)
-3. Return output as `exec:<id> output:\n\n<result>`
-4. If no plugin matches, fall through to built-in exec: dispatch
+```bash
+node <gm-plugkit-install>/lang-host-runner.js <projectDir> '<command>' '<code-base64>'
+```
 
-## LSP Context (prompt-submit hook — gm-cc managed)
+Returns one JSON line on stdout:
 
-1. Load all plugins from `<projectDir>/lang/`
-2. For each plugin with `lsp` + `extensions`: scan top 3 most-recently-modified matching files
-3. Call `plugin.lsp.check(fileContent, dir)` synchronously — async not supported here
-4. Inject diagnostics as `<file>:<line>:<col>: <severity>: <message>` into `additionalContext`
+```json
+{ "ok": true,  "plugin_id": "blender", "output": "...", "ms": 6533 }
+{ "ok": false, "error": "no-plugin-matched", "command": "...", "available": ["blender"] }
+{ "ok": false, "error": "timeout", "plugin_id": "blender", "ms": 30001 }
+```
 
-## context Injection (session-start + prompt-submit hooks — gm-cc managed)
-
-For each plugin with `context`:
-- String: injected directly into `additionalContext`
-- Function: called, result injected (truncated to 2000 chars)
-- Failures are silent
+A wasm-side `lang` verb in rs-plugkit that wraps this runner via `host_exec_js`
+is the integration path that surfaces the runner through `.gm/exec-spool/in/lang/<N>.txt`.
+Until that verb lands, callers invoke `lang-host-runner.js` directly.
 
 ## Constraints
 
-- `exec.run` must resolve within 10s or be killed via `AbortController`
-- Multiple plugins may match — first match wins
+- `exec.run` must resolve within 30s or the runner kills the child
+- Multiple plugins may match — first match wins (by `readdir` order)
 - Plugins must be CommonJS (`module.exports`)
 - No plugin may mutate global state or spawn persistent processes
+- Plugins run in the host Node process (not wasm) and have full Node API access
